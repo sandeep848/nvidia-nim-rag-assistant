@@ -1,119 +1,101 @@
+"""Hybrid, cited document RAG using NVIDIA NIM."""
+
+from __future__ import annotations
+
 import os
+import tempfile
+
 import streamlit as st
-import time
 from dotenv import load_dotenv
-from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings, ChatNVIDIA
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-class MultimodalAIApp:
-    def __init__(self):
-        load_dotenv()
-        self.NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-        if not self.NVIDIA_API_KEY:
-            st.error("NVIDIA API Key not found. Please set it in your .env file.")
-        self.CHUNK_SIZE = 700
-        self.CHUNK_OVERLAP = 50
-        self.MAX_DOCUMENTS = 50
+from rag_core import Chunk, lexical_rank, reciprocal_rank_fusion
 
-    def load_and_process_document(self, uploaded_file):
-        try:
-            with open(uploaded_file.name, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            if uploaded_file.name.endswith('.pdf'):
-                loader = PyPDFLoader(uploaded_file.name)
-            elif uploaded_file.name.endswith('.txt'):
-                loader = TextLoader(uploaded_file.name)
-            else:
-                st.warning(f"Unsupported file type: {uploaded_file.name}")
-                return None
-            documents = loader.load()
-            embeddings = NVIDIAEmbeddings()
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=self.CHUNK_SIZE, 
-                chunk_overlap=self.CHUNK_OVERLAP
-            )
-            split_documents = text_splitter.split_documents(
-                documents[:self.MAX_DOCUMENTS]
-            )
-            vector_store = FAISS.from_documents(split_documents, embeddings)
-            return vector_store
-        except Exception as e:
-            st.error(f"Error processing document: {e}")
-            return None
-        finally:
-            if os.path.exists(uploaded_file.name):
-                os.remove(uploaded_file.name)
+load_dotenv()
+st.set_page_config(page_title="NVIDIA NIM Knowledge Assistant", layout="wide")
+st.title("NVIDIA NIM Knowledge Assistant")
+st.caption("Hybrid dense + lexical retrieval with page-level citations")
 
-    def create_retrieval_chain(self):
-        try:
-            llm = ChatNVIDIA(model="meta/llama3-70b-instruct")
-            prompt = ChatPromptTemplate.from_template("""
-            You are a helpful AI assistant. Answer the questions based strictly on the provided context.
-            If the answer is not in the context, say "I cannot find the answer in the provided documents."
+api_key = st.sidebar.text_input(
+    "NVIDIA API key", type="password", value=os.getenv("NVIDIA_API_KEY", "")
+)
+top_k = st.sidebar.slider("Retrieved passages", 2, 8, 4)
+uploads = st.file_uploader("Upload PDF knowledge sources", type="pdf", accept_multiple_files=True)
 
-            Context:
-            {context}
+if "rag" not in st.session_state:
+    st.session_state.rag = None
 
-            Question: {input}
-            
-            Helpful Answer:
-            """)
-            document_chain = create_stuff_documents_chain(llm, prompt)
-            return document_chain
-        except Exception as e:
-            st.error(f"Error creating retrieval chain: {e}")
-            return None
+if st.button("Build knowledge index", disabled=not uploads or not api_key):
+    os.environ["NVIDIA_API_KEY"] = api_key
+    documents = []
+    for upload in uploads:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
+            handle.write(upload.getvalue())
+            path = handle.name
+        loaded = PyPDFLoader(path).load()
+        for document in loaded:
+            document.metadata["source"] = upload.name
+        documents.extend(loaded)
+        os.unlink(path)
 
-    def run(self):
-        st.set_page_config(
-            page_title="NVIDIA Document Q&A", 
-            page_icon="📄"
+    splits = RecursiveCharacterTextSplitter(
+        chunk_size=900, chunk_overlap=140
+    ).split_documents(documents)
+    chunks = [
+        Chunk(
+            chunk_id=index,
+            text=document.page_content,
+            source=document.metadata.get("source", "document"),
+            page=int(document.metadata.get("page", 0)) + 1,
         )
-        st.title("🚀 Document Question Answering using NVIDIA_NIM")
-        st.header("📄 Upload Document")
-        uploaded_file = st.file_uploader(
-            "Upload a document (PDF or TXT)", 
-            type=['pdf', 'txt']
-        )
-        if uploaded_file:
-            with st.spinner("Processing document..."):
-                vector_store = self.load_and_process_document(uploaded_file)
-            if vector_store:
-                st.session_state.vector_store = vector_store
-                st.success("Document processed successfully!")
-                query = st.text_input("Enter your question about the document:")
-                if query and st.button("Get Answer"):
-                    try:
-                        document_chain = self.create_retrieval_chain()
-                        if document_chain:
-                            retriever = st.session_state.vector_store.as_retriever(
-                                search_kwargs={"k": 5}
-                            )
-                            retrieval_chain = create_retrieval_chain(retriever, document_chain)
-                            start_time = time.time()
-                            response = retrieval_chain.invoke({'input': query})
-                            response_time = time.time() - start_time
-                            st.subheader("Answer")
-                            st.write(response['answer'])
-                            st.caption(f"Response generated in {response_time:.2f} seconds")
-                            with st.expander("Relevant Document Chunks"):
-                                for i, doc in enumerate(response["context"], 1):
-                                    st.text_area(
-                                        f"Chunk {i}", 
-                                        value=doc.page_content, 
-                                        height=100
-                                    )
-                    except Exception as e:
-                        st.error(f"Error processing question: {e}")
+        for index, document in enumerate(splits)
+    ]
+    embeddings = NVIDIAEmbeddings(model="nvidia/nv-embedqa-e5-v5")
+    vectorstore = FAISS.from_texts(
+        [chunk.text for chunk in chunks],
+        embeddings,
+        metadatas=[{"chunk_id": chunk.chunk_id} for chunk in chunks],
+    )
+    st.session_state.rag = (chunks, vectorstore)
+    st.success(f"Indexed {len(chunks)} passages from {len(uploads)} PDF(s).")
 
-def main():
-    app = MultimodalAIApp()
-    app.run()
+question = st.chat_input("Ask a question about the indexed documents")
 
-if __name__ == "__main__":
-    main()
+if question:
+    if not st.session_state.rag:
+        st.error("Build the knowledge index first.")
+        st.stop()
+
+    os.environ["NVIDIA_API_KEY"] = api_key
+    chunks, vectorstore = st.session_state.rag
+    dense_docs = vectorstore.similarity_search(question, k=max(top_k * 2, 8))
+    dense_ids = [int(doc.metadata["chunk_id"]) for doc in dense_docs]
+    lexical_ids = lexical_rank(question, chunks)[: max(top_k * 2, 8)]
+    fused_ids = reciprocal_rank_fusion(dense_ids, lexical_ids)[:top_k]
+    selected = [chunks[index] for index in fused_ids]
+
+    context = "\n\n".join(
+        f"[{i}] {chunk.source}, page {chunk.page}\n{chunk.text}"
+        for i, chunk in enumerate(selected, start=1)
+    )
+    llm = ChatNVIDIA(model="meta/llama-3.1-70b-instruct", temperature=0)
+    response = llm.invoke(
+        f"""Answer only from the supplied passages.
+Cite factual statements with passage numbers such as [1].
+If the passages do not support an answer, say so.
+
+Question: {question}
+
+Passages:
+{context}"""
+    ).content
+
+    st.chat_message("user").write(question)
+    st.chat_message("assistant").write(response)
+    with st.expander("Retrieved evidence"):
+        for index, chunk in enumerate(selected, start=1):
+            st.markdown(f"**[{index}] {chunk.source}, page {chunk.page}**")
+            st.write(chunk.text)
